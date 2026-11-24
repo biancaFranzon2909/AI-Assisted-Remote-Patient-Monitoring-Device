@@ -1,0 +1,30 @@
+model parceiro {
+  id           String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  is_active    Boolean      @default(true)
+  criado_em    DateTime     @default(now()) @db.Timestamp(6)
+
+  nome_fantasia String       @db.VarChar(200)
+  razao_social  String?      @unique @db.VarChar(200)
+  email         String?      @unique @db.VarChar(100)
+  cnpj          String       @unique @db.VarChar(18)
+  inscricao_estadual String?  @db.VarChar(50)
+  website      String?      @db.VarChar(100)
+  nota_interna String?      @db.VarChar(100)
+
+  endereco     String?      @db.VarChar(100)
+  estado       String?      @db.Char(2)
+  cep          String?      @db.VarChar(10)
+  pais         String?      @db.VarChar(50)
+  cidade       String?      @db.VarChar(100)
+
+  empresa_id   String       @db.Uuid
+  empresa      empresa      @relation(fields: [empresa_id], references: [id], onDelete: Cascade, map: "fk_cliente_empresa")
+
+  parceria_id  Int?         @unique
+  parceria     parceria?
+
+  lancamentos  lancamento[]
+  projetos     projeto[]
+
+  @@index([razao_social, cnpj, id], map: "idx_nome_cnpj_id")
+}

@@ -1,0 +1,25 @@
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+model lancamento {
+  id              String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  usuario_id      String          @db.Uuid
+  atividade_id    String          @db.Uuid
+  data_lancamento DateTime        @db.Timestamptz(6)
+  hora_inicio     DateTime        @db.Time(6)
+  hora_fim        DateTime        @db.Time(6)
+  descricao       String?
+  criado_em       DateTime?       @default(now()) @db.Timestamptz(6)
+  duracao_total   Float?
+  tipo_lancamento TipoLancamento? @default(MANUAL)
+  cliente_id      String          @db.Uuid
+  projeto_id      String          @db.Uuid
+  despesas        despesa[]
+  atividade       atividade       @relation(fields: [atividade_id], references: [id], onDelete: NoAction, onUpdate: NoAction, map: "fk_lancamento_atividade")
+  parceiro        parceiro        @relation(fields: [cliente_id], references: [id], onDelete: NoAction, onUpdate: NoAction, map: "fk_lancamento_parceiro")
+  projeto         projeto         @relation(fields: [projeto_id], references: [id], onDelete: NoAction, onUpdate: NoAction, map: "fk_lancamento_projeto")
+  usuario         usuario         @relation(fields: [usuario_id], references: [id], onDelete: NoAction, onUpdate: NoAction, map: "fk_usuario_lancamento")
+}
+
+enum TipoLancamento {
+  MANUAL
+  CRONOMETRO
+}

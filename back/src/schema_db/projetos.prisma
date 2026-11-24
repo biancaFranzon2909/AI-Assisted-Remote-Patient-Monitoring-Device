@@ -1,0 +1,41 @@
+model projeto {
+  id              String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  nome_projeto    String        @db.VarChar(100)
+  descricao       String
+  data_inicio     DateTime      @default(now()) @db.Timestamptz(6)
+  data_fim        DateTime      @default(now()) @db.Timestamptz(6)
+  horas_previstas Float?
+  horas_gastas    Float         @default(0.0)
+  ref_cliente     String?       @db.VarChar(50)
+  empresa_id      String        @db.Uuid
+  status          StatusProjeto @default(EmAndamento)
+  is_active       Boolean       @default(true)
+  compartilhado   Boolean       @default(false)
+  centro_custo    String?       @db.VarChar(20)
+  solicitante     String?       @db.VarChar(50)
+  tipo            TipoProjeto   @default(INTERNO)
+  parceiro_id     String        @db.Uuid
+  atividades      atividade[]
+  lancamentos     lancamento[]
+  parceiro        parceiro      @relation(fields: [parceiro_id], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "fk_projeto_cliente")
+  empresa         empresa       @relation(fields: [empresa_id], references: [id], onDelete: Cascade)
+  equipe          usuario[]     @relation("projetoTousuario")
+}
+
+enum StatusProjeto {
+  EmEspera
+  Orcando
+  EmAndamento
+  Finalizado
+  Cancelado
+}
+
+enum TipoProjeto {
+  SCC
+  ESTIMATIVA
+  ORCADO
+  INTERNO
+  CHAMADO
+  ESTUDO
+  AMS
+}

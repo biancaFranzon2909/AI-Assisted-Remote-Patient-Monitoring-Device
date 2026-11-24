@@ -1,0 +1,13 @@
+model empresa {
+  id            String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  identificador String            @unique @db.VarChar(50)
+  criado_em     DateTime?         @default(now()) @db.Timestamptz(6)
+  criado_por    String            @db.Uuid
+  nome_empresa  String            @unique @db.VarChar(100)
+  eventos       administrativo[]
+  atividades    atividade[]
+  usuarios      empresaUsuarios[]
+  parceiros     parceiro[]
+  parcerias     parceria[]
+  projetos      projeto[]
+}

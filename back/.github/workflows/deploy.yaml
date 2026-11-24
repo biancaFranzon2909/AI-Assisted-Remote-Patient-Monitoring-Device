@@ -1,0 +1,124 @@
+name: Deploy
+
+# hom  -> usa os secrets/variables com sufixo _HOM
+# prod -> usa os secrets/variables com sufixo _PROD
+# Tudo fica no nivel do repositorio (nao precisa de GitHub Environments).
+on:
+  push:
+    branches: [hom, prod]
+
+# Nunca roda dois deploys da mesma branch ao mesmo tempo
+concurrency:
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: "24.15"
+  BUILD_DIR: dist
+
+jobs:
+  # ---------------------------------------------------------------
+  # 1) BUILD: roda no runner, totalmente fora da VPS / do local de deploy.
+  #    Se qualquer passo falhar, o job morre, o artefato nao e criado
+  #    e o job "deploy" nunca executa (needs: build).
+  # ---------------------------------------------------------------
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Instala dependencias
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Garante que o build gerou saida
+        run: |
+          if [ -z "$(ls -A "$BUILD_DIR" 2>/dev/null)" ]; then
+            echo "::error::Pasta $BUILD_DIR vazia ou inexistente. Deploy cancelado."
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ github.sha }}
+          path: ${{ env.BUILD_DIR }}
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------
+  # 2) DEPLOY: so roda se o build passou.
+  #    Escolhe porta/pasta/chave pela branch (sufixo _PROD ou _HOM).
+  # ---------------------------------------------------------------
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      SSH_PORT: ${{ github.ref_name == 'prod' && secrets.SSH_PORT_PROD || secrets.SSH_PORT_HOM }}
+      DEPLOY_PATH: chronotracker/back # relativo ao home do usuario SSH = ~/chronotracker/back
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-${{ github.sha }}
+          path: build
+
+      - name: Configura SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ github.ref_name == 'prod' && secrets.SSH_KEY_PROD || secrets.SSH_KEY_HOM }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" >> ~/.ssh/known_hosts
+
+      - name: Envia o build para uma pasta de staging na VPS
+        run: |
+          SSH_CMD="ssh -i $HOME/.ssh/deploy_key -p $SSH_PORT -o IdentitiesOnly=yes -o BatchMode=yes"
+          rsync -az --delete -e "$SSH_CMD" build/ "$SSH_USER@$SSH_HOST:${DEPLOY_PATH}.incoming/"
+
+      - name: Copia para o local de deploy e reinicia o pm2
+        run: |
+          ssh -i "$HOME/.ssh/deploy_key" -p "$SSH_PORT" -o IdentitiesOnly=yes -o BatchMode=yes \
+            "$SSH_USER@$SSH_HOST" "bash -s -- '$DEPLOY_PATH'" <<'REMOTE'
+          # sessao SSH nao interativa nao carrega o nvm: garante node/pm2 no PATH
+          export NVM_DIR="$HOME/.nvm"
+          [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+
+          set -euo pipefail
+          DEPLOY_PATH="$1"
+          TARGET="$DEPLOY_PATH/dist"
+          PM2_NAME="back-end"
+          INCOMING="${DEPLOY_PATH}.incoming"
+          BACKUP="${DEPLOY_PATH}.bak"
+
+          mkdir -p "$TARGET" "$BACKUP"
+
+          # backup da versao atual (para rollback)
+          rsync -a --delete "$TARGET/" "$BACKUP/"
+
+          # a partir daqui, qualquer erro dispara rollback
+          rollback() {
+            echo "Falha no deploy. Fazendo rollback..." >&2
+            rsync -a --delete "$BACKUP/" "$TARGET/"
+
+            pm2 startOrRestart ~/chronotracker/back/ecosystem.config.js --env ${{ github.ref_name }} --update-env "$PM2_NAME" >/dev/null 2>&1 || true
+          }
+          trap rollback ERR
+
+          # copia o build novo para dentro do local de deploy
+          rsync -a --delete "$INCOMING/" "$TARGET/"
+
+          pm2 startOrRestart ~/chronotracker/back/ecosystem.config.js --env ${{ github.ref_name }} --update-env
+          pm2 save
+
+          rm -rf "$INCOMING"
+          echo "Deploy OK em $TARGET"
+          REMOTE

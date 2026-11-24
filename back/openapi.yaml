@@ -1,0 +1,3869 @@
+openapi: 3.1.0
+info:
+  title: ChronoTracker API
+  version: 1.0.0
+  license:
+    name: Proprietária
+    identifier: LicenseRef-Proprietary
+  summary: API de controle de horas, despesas e eventos administrativos do ChronoTracker.
+  description: |
+    Gerado a partir do código real (`src/router/index.ts`, `src/config/app.ts`, `src/middlewares/*`,
+    `src/entities/*/*.controller.ts` e `*.service.ts`). Pontos que o código deixa ambíguos estão marcados
+    com `x-todo: confirmar` e explicados em `x-todo-detalhe`.
+
+    ## Autenticação
+    - Sessão por cookies `httpOnly`: `_tk` (JWT de acesso, claim `type: access`) e `_rtk` (refresh token
+      opaco), gravados por `POST /auth/login` e rotacionados por `POST /auth/refresh-token`.
+      `secure` + `SameSite=None` só com `NODE_ENV=production`; senão `SameSite=Lax`.
+    - Rotas de empresa exigem o cookie `_tk` **e** o header `x-workspace-id` (= `empresa.identificador`);
+      o middleware confere o vínculo do usuário em `empresaUsuarios`.
+    - Exceções sem empresa (só `_tk`): `GET /auth/me`, `POST /empresas/create`,
+      `POST /empresas/usuario/add/{email}`, `POST /convite/aceitar/{token}`.
+    - Públicas: `/auth/login`, `/auth/register`, `/auth/refresh-token`, `/auth/logout`, `/auth/password-reset`,
+      `/auth/password-reset-verify`, `/health` e `GET /convite/aceite/{token}`.
+    - O perfil (`OWNER`, `ADMIN`, `COLAB`) é por empresa e vem do banco (não está no JWT). `COLAB` só vê e
+      altera os próprios lançamentos e o que deriva deles; recurso fora do escopo responde 404.
+    - `/api/*` aceita `Authorization: Bearer <apiKey>` (a `apiKey` devolvida por `GET /auth/me`, JWT sem
+      expiração), copiado para o cookie `_tk`; o header `x-workspace-id` continua obrigatório.
+
+    Falhas do middleware de autenticação (antes do controller), válidas para toda rota protegida:
+    `401` "Token não fornecido" / "Token inválido" / "Token expirado"; `400` "Empresa não identificada."
+    (sem `x-workspace-id`); `404` "Empresa não encontrada."; `403` "Usuário não pertence a esta empresa.";
+    `500` "Erro na autenticação".
+
+    ## Formato
+    - Corpo de entrada em snake_case (exceções indicadas na operação); respostas em camelCase (algumas
+      devolvem a linha do banco em snake_case, indicado no schema).
+    - Sucesso: `{ "error": false, "data" | "message" }`. Erro: `{ "error": true, "message" }`.
+    - **Atenção:** quando o service lança 404 (`AppError`), o controller responde **`error: false`** com
+      status 404. O 404 do middleware de autenticação e o de rota inexistente respondem `error: true`.
+    - JSON malformado → 400 "JSON inválido."; corpo acima de 1 MB → 413; rota inexistente → 404
+      "Rota não encontrada."; erro não tratado → 500 "Erro interno." (sem stack nem SQL).
+    - Toda resposta traz o header `X-Request-Id` (reaproveita o do cliente se casar com
+      `^[A-Za-z0-9._:-]{1,100}$`; senão gera um UUID).
+    - Horas são `Float` (horas decimais); totais formatados saem como `"HH:mm"`. `hora_inicio`/`hora_fim`
+      são colunas `time` e saem como date-time em 1970-01-01 (ex.: `1970-01-01T08:00:00.000Z`).
+    - Não há paginação nas listagens.
+
+    ## Teste de carga
+    Cada operação tem `x-load-weight` (`leitura`, `escrita` ou `pesado`) e, quando relevante, `x-load-note`.
+    Rate limit em memória (vale para 1 processo PM2), responde 429 "Muitas tentativas. Tente novamente em
+    alguns minutos.": login 10 falhas/15 min por IP; register 10/h por IP; password-reset 5/15 min por IP;
+    password-reset-verify 10/15 min por IP; refresh-token 120/15 min por IP; convite/create 15/h por usuário.
+servers:
+  - url: http://localhost:{porta}
+    description: Instância local. No PM2, 3001 = produção (NODE_ENV=production) e 3005 = homologação.
+    variables:
+      porta:
+        default: '3001'
+        enum:
+          - '3001'
+          - '3005'
+    x-todo: confirmar
+    x-todo-detalhe: URLs públicas de homologação e produção (atrás de proxy) não estão no código.
+security:
+  - cookieAuth: []
+    workspaceId: []
+tags:
+  - name: auth
+    description: Login, registro, sessão por cookies e recuperação de senha.
+  - name: usuarios
+    description: Usuários da empresa, perfil do usuário logado e estatísticas.
+  - name: empresas
+    description: Criação e exclusão de empresa e gestão de vínculos.
+  - name: convite
+    description: Convite por e-mail para entrar numa empresa.
+  - name: clientes
+    description: Clientes (modelo `parceiro`), com parceria opcional com outra empresa.
+  - name: parceria
+    description: Compartilhamento de projeto e atividades com a empresa parceira do cliente.
+  - name: projetos
+    description: Projetos de um cliente.
+  - name: atividades
+    description: Atividades de um projeto.
+  - name: lancamentos
+    description: Lançamentos de horas (timesheet).
+  - name: despesas
+    description: Despesas vinculadas a um lançamento de horas.
+  - name: administrativo
+    description: Férias, faltas e eventos.
+  - name: dashboard
+    description: Dados consolidados do painel.
+  - name: relatorios
+    description: Relatórios de lançamentos e despesas em JSON ou XLSX.
+  - name: integracao
+    description: API para integração externa autenticada por API key.
+  - name: sistema
+    description: Saúde do serviço.
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: _tk
+      description: JWT de acesso gravado por `POST /auth/login` (validade `ACCESS_TOKEN_EXPIRES_IN`, padrão 15h).
+    workspaceId:
+      type: apiKey
+      in: header
+      name: x-workspace-id
+      description: Identificador da empresa (`empresa.identificador`). O usuário precisa ter vínculo com ela.
+    refreshCookie:
+      type: apiKey
+      in: cookie
+      name: _rtk
+      description: Refresh token opaco (validade `REFRESH_TOKEN_TTL_DAYS` dias, padrão 30); guardado como SHA-256.
+    apiKeyBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: API key do usuário (campo `apiKey` de `GET /auth/me`). Aceita só em `/api/*`.
+  headers:
+    SetAuthCookies:
+      description: Grava os cookies `_tk` e `_rtk` (`HttpOnly`; `Secure; SameSite=None` em produção, `SameSite=Lax` fora dela).
+      schema:
+        type: string
+      example: _tk=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0eXBlIjoiYWNjZXNzIn0.sig; Max-Age=54000; Path=/; HttpOnly; SameSite=Lax
+    ClearAuthCookies:
+      description: Expira os cookies `_tk` e `_rtk`.
+      schema:
+        type: string
+      example: _tk=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Lax
+    RetryAfter:
+      description: Segundos até a janela do rate limit reabrir.
+      schema:
+        type: integer
+    ContentDisposition:
+      description: Nome do arquivo gerado (exposto via `Access-Control-Expose-Headers`).
+      schema:
+        type: string
+      example: attachment; filename="relatorio_lancamentos_1793622000000.xlsx"
+  parameters:
+    IdPath:
+      name: id
+      in: path
+      required: true
+      description: Id (uuid) do recurso.
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    RelatorioTipo:
+      name: tipo
+      in: query
+      required: false
+      description: '"despesas" gera relatório de despesas; ausente ou outro valor, de lançamentos.'
+      schema:
+        type: string
+        enum: [despesas]
+    RelatorioFilext:
+      name: filext
+      in: query
+      required: false
+      description: Com valor, devolve o arquivo em vez de JSON.
+      schema:
+        type: string
+        enum: [xlsx, pdf]
+  responses:
+    BadRequest:
+      description: Entrada inválida ou regra de negócio violada.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: true
+            message: Empresa não identificada.
+    Unauthorized:
+      description: Cookie `_tk` ausente, inválido ou expirado (ou credencial inválida).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: true
+            message: Token não fornecido
+    Forbidden:
+      description: Usuário sem vínculo com a empresa do `x-workspace-id` ou sem permissão.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: true
+            message: Usuário não pertence a esta empresa.
+    NotFound:
+      description: |
+        Recurso inexistente ou fora do escopo do usuário. Quando vem do service, `error` é `false`
+        (comportamento atual de `errorHandler`); quando vem do middleware (empresa do header), `error` é `true`.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: false
+            message: Recurso não encontrado.
+    Conflict:
+      description: Violação de unicidade.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: true
+            message: CNPJ já existente
+    TooManyRequests:
+      description: Rate limit excedido.
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: true
+            message: Muitas tentativas. Tente novamente em alguns minutos.
+    PayloadTooLarge:
+      description: Corpo JSON acima de 1 MB.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: true
+            message: Corpo da requisição grande demais.
+    InternalError:
+      description: Erro interno (detalhe só no log, com o requestId).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: true
+            message: Erro interno.
+    RelatorioOk:
+      description: Relatório gerado (JSON) ou arquivo (quando `filext` é enviado).
+      headers:
+        Content-Disposition:
+          $ref: '#/components/headers/ContentDisposition'
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: boolean
+                const: false
+              data:
+                oneOf:
+                  - type: array
+                    description: Lançamentos (padrão).
+                    items:
+                      $ref: '#/components/schemas/RelatorioLancamento'
+                  - $ref: '#/components/schemas/RelatorioDespesas'
+        application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+          schema:
+            type: string
+            contentMediaType: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+  requestBodies:
+    RelatorioFiltros:
+      required: false
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/RelatorioFiltros'
+          examples:
+            lancamentosOutubro:
+              summary: Lançamentos de outubro de um cliente, dois colaboradores
+              value:
+                data:
+                  inicio: '2026-10-01'
+                  fim: '2026-10-31'
+                cliente:
+                  inicio: Metalúrgica Vale
+                  fim: Metalúrgica Vale
+                colaboradores:
+                  - 3f6c2a1e-8b4d-4c2f-9a7e-1d2b3c4d5e6f
+                  - 7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d
+            semFiltro:
+              summary: Sem filtros (tudo o que o perfil permite ver)
+              value: {}
+  schemas:
+    Uuid:
+      type: string
+      format: uuid
+      examples:
+        - 3f6c2a1e-8b4d-4c2f-9a7e-1d2b3c4d5e6f
+    HorasHHmm:
+      type: string
+      description: Horas decimais formatadas como `HH:mm` (pode ter sinal negativo e mais de 2 dígitos de hora).
+      pattern: '^-?\d{2,}:\d{2}$'
+      examples:
+        - '89:30'
+    HoraTime:
+      type: string
+      format: date-time
+      description: Coluna `time` serializada como date-time em 1970-01-01 (UTC).
+      examples:
+        - '1970-01-01T08:00:00.000Z'
+    HoraEntrada:
+      type: string
+      pattern: '^([01]\d|2[0-3]):[0-5]\d$'
+      description: Horário `HH:mm` (24h), interpretado em UTC sobre a data do lançamento.
+      examples:
+        - '08:00'
+    Cargo:
+      type: string
+      enum: [OWNER, ADMIN, COLAB]
+    StatusProjeto:
+      type: string
+      enum: [EmEspera, Orcando, EmAndamento, Finalizado, Cancelado]
+    TipoProjeto:
+      type: string
+      enum: [SCC, ESTIMATIVA, ORCADO, INTERNO, CHAMADO, ESTUDO, AMS]
+    Prioridade:
+      type: string
+      enum: [BAIXA, NORMAL, ALTA, CRITICA]
+    TipoAtividade:
+      type: string
+      enum: [ESTIMATIVA, ORCADO, INTERNO, CHAMADO, ESTUDO, SCC]
+    TipoAdministrativo:
+      type: string
+      enum: [FERIAS, FALTA, EVENTO]
+    TipoLancamento:
+      type: string
+      enum: [MANUAL, CRONOMETRO]
+    ErrorResponse:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: boolean
+          description: '`true` em erros; `false` nos 404 lançados pelo service (ver descrição geral).'
+        message:
+          type: string
+    InviteErrorResponse:
+      type: object
+      required: [error, code, message]
+      properties:
+        error:
+          type: boolean
+          const: true
+        code:
+          type: string
+          enum: [inviteInvalid, inviteExpired, inviteUnavailable, accountInactive, inviteAccountMismatch]
+        message:
+          type: string
+    SuccessMessage:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: boolean
+          const: false
+        message:
+          type: string
+    SuccessFlag:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: boolean
+          const: false
+    MessageOnly:
+      type: object
+      description: Formato fora do padrão (sem o campo `error`), usado por `empresas`.
+      required: [message]
+      properties:
+        message:
+          type: string
+    Me:
+      type: object
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        apiKey:
+          type: [string, 'null']
+          description: JWT sem expiração para `/api/*`.
+        email:
+          type: [string, 'null']
+          format: email
+        isActive:
+          type: boolean
+        nomeCompleto:
+          type: string
+        nomeUsuario:
+          type: string
+        empresas:
+          type: array
+          items:
+            type: object
+            properties:
+              nomeEmpresa:
+                type: string
+              identificador:
+                type: string
+              cargo:
+                $ref: '#/components/schemas/Cargo'
+    UsuarioListItem:
+      type: object
+      properties:
+        usuarioId:
+          $ref: '#/components/schemas/Uuid'
+        nomeCompleto:
+          type: string
+        nomeUsuario:
+          type: string
+        email:
+          type: [string, 'null']
+        cargo:
+          $ref: '#/components/schemas/Cargo'
+        isActive:
+          type: boolean
+    UsuarioDetalhe:
+      type: object
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        nomeUsuario:
+          type: string
+        nomeCompleto:
+          type: string
+        email:
+          type: [string, 'null']
+        isActive:
+          type: boolean
+        cargo:
+          $ref: '#/components/schemas/Cargo'
+        projetos:
+          type: array
+          items:
+            type: object
+            properties:
+              projetoId:
+                $ref: '#/components/schemas/Uuid'
+              projetoNome:
+                type: string
+              atividades:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    atividadeId:
+                      $ref: '#/components/schemas/Uuid'
+                    nomeAtividade:
+                      type: string
+        lancamentos:
+          type: array
+          description: Vazio quando um COLAB consulta um colega.
+          items:
+            type: object
+            properties:
+              lancamentoId:
+                $ref: '#/components/schemas/Uuid'
+              descricao:
+                type: [string, 'null']
+              duracaoTotal:
+                type: number
+              dataLancamento:
+                type: string
+                format: date-time
+              horaInicio:
+                $ref: '#/components/schemas/HoraTime'
+              horaFim:
+                $ref: '#/components/schemas/HoraTime'
+              atividade:
+                type: object
+                properties:
+                  atividadeId:
+                    $ref: '#/components/schemas/Uuid'
+                  nomeAtividade:
+                    type: string
+                  projeto:
+                    type: object
+                    properties:
+                      projetoId:
+                        $ref: '#/components/schemas/Uuid'
+                      nomeProjeto:
+                        type: string
+    UsuarioStats:
+      type: object
+      properties:
+        totalHorasLancadas:
+          $ref: '#/components/schemas/HorasHHmm'
+        totalLancamentos:
+          type: integer
+        totalProjetos:
+          type: integer
+        totalAtividades:
+          type: integer
+        horasPorProjeto:
+          type: array
+          items:
+            type: object
+            properties:
+              projetoId:
+                $ref: '#/components/schemas/Uuid'
+              nomeProjeto:
+                type: string
+              totalHoras:
+                type: number
+    ClienteListItem:
+      type: object
+      properties:
+        clienteId:
+          $ref: '#/components/schemas/Uuid'
+        nomeFantasia:
+          type: [string, 'null']
+        razaoSocial:
+          type: string
+        email:
+          type: [string, 'null']
+        localizacao:
+          type: string
+          description: '`cidade/UF`.'
+        cnpj:
+          type: string
+        cep:
+          type: [string, 'null']
+        endereco:
+          type: [string, 'null']
+        projetos:
+          type: integer
+          description: Quantidade de projetos.
+        status:
+          type: boolean
+    ClienteDetalhe:
+      type: object
+      properties:
+        clienteId:
+          $ref: '#/components/schemas/Uuid'
+        nomeFantasia:
+          type: [string, 'null']
+        razaoSocial:
+          type: [string, 'null']
+          x-todo: confirmar
+          x-todo-detalhe: O service preenche `razaoSocial` com `nome_fantasia`.
+        inscricaoEstadual:
+          type: [string, 'null']
+        website:
+          type: [string, 'null']
+        notaInterna:
+          type: [string, 'null']
+          description: '`null` quando o cliente é visto pela empresa parceira.'
+        pais:
+          type: [string, 'null']
+        email:
+          type: [string, 'null']
+        cidade:
+          type: [string, 'null']
+        estado:
+          type: [string, 'null']
+        cnpj:
+          type: string
+        cep:
+          type: [string, 'null']
+        endereco:
+          type: [string, 'null']
+        identificadorParceiro:
+          type: [string, 'null']
+        projetosNumero:
+          type: integer
+        status:
+          type: boolean
+        compartilhado:
+          type: boolean
+        projetos:
+          type: array
+          items:
+            type: object
+            properties:
+              compartilhado:
+                type: boolean
+              projetoId:
+                $ref: '#/components/schemas/Uuid'
+              nomeProjeto:
+                type: string
+              horasPrevistas:
+                type: [number, 'null']
+              horasGastas:
+                type: number
+              statusLabel:
+                type: string
+              statusClass:
+                type: string
+        totalDespesas:
+          type: number
+        totalHorasGastas:
+          $ref: '#/components/schemas/HorasHHmm'
+    ParceiroRow:
+      type: object
+      description: Linha do modelo `parceiro` em snake_case.
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        is_active:
+          type: boolean
+        criado_em:
+          type: string
+          format: date-time
+        nome_fantasia:
+          type: [string, 'null']
+        razao_social:
+          type: string
+        email:
+          type: [string, 'null']
+        cnpj:
+          type: string
+        inscricao_estadual:
+          type: [string, 'null']
+        website:
+          type: [string, 'null']
+        nota_interna:
+          type: [string, 'null']
+        endereco:
+          type: [string, 'null']
+        estado:
+          type: [string, 'null']
+        cep:
+          type: [string, 'null']
+        pais:
+          type: [string, 'null']
+        cidade:
+          type: [string, 'null']
+        empresa_id:
+          $ref: '#/components/schemas/Uuid'
+        parceria_id:
+          type: [integer, 'null']
+    ProjetoRow:
+      type: object
+      description: Linha do modelo `projeto` em snake_case (campos principais).
+      additionalProperties: true
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        nome_projeto:
+          type: string
+        descricao:
+          type: [string, 'null']
+        status:
+          $ref: '#/components/schemas/StatusProjeto'
+        tipo:
+          type: [string, 'null']
+        horas_previstas:
+          type: [number, 'null']
+        horas_gastas:
+          type: number
+        data_inicio:
+          type: [string, 'null']
+          format: date-time
+        data_fim:
+          type: [string, 'null']
+          format: date-time
+        parceiro_id:
+          $ref: '#/components/schemas/Uuid'
+        empresa_id:
+          $ref: '#/components/schemas/Uuid'
+        compartilhado:
+          type: boolean
+        is_active:
+          type: boolean
+    ClienteInput:
+      type: object
+      properties:
+        cnpj:
+          type: string
+        razao_social:
+          type: string
+        nome_fantasia:
+          type: string
+        email:
+          type: string
+          format: email
+        cep:
+          type: string
+        endereco:
+          type: string
+        cidade:
+          type: string
+        estado:
+          type: string
+          maxLength: 2
+        inscricao_estadual:
+          type: string
+        nota_interna:
+          type: string
+        pais:
+          type: string
+        website:
+          type: string
+    ProjetoListItem:
+      type: object
+      properties:
+        projetoId:
+          $ref: '#/components/schemas/Uuid'
+        nomeProjeto:
+          type: string
+        razaoSocial:
+          type: string
+        status:
+          $ref: '#/components/schemas/StatusProjeto'
+        limiteAtingido:
+          type: boolean
+        refCliente:
+          type: [string, 'null']
+        horasGastas:
+          type: number
+        horasPrevistas:
+          type: [number, 'null']
+        dataInicio:
+          type: [string, 'null']
+          format: date-time
+        dataFim:
+          type: [string, 'null']
+          format: date-time
+        atividades:
+          type: integer
+        centroCusto:
+          type: [string, 'null']
+        solicitante:
+          type: [string, 'null']
+        tipoProjeto:
+          type: [string, 'null']
+        isActive:
+          type: boolean
+        compartilhado:
+          type: boolean
+    ProjetoDetalhe:
+      type: object
+      properties:
+        projetoId:
+          $ref: '#/components/schemas/Uuid'
+        nomeProjeto:
+          type: string
+        refClienteProjeto:
+          type: [string, 'null']
+        descricao:
+          type: [string, 'null']
+        dataInicio:
+          type: [string, 'null']
+          format: date-time
+        dataFim:
+          type: [string, 'null']
+          format: date-time
+        compartilharComCliente:
+          type: boolean
+        horasGastas:
+          type: number
+        horasPrevistas:
+          oneOf:
+            - type: number
+            - type: string
+              const: Em Aberto
+        nomeFantasia:
+          type: [string, 'null']
+        razaoSocial:
+          type: string
+        clienteId:
+          $ref: '#/components/schemas/Uuid'
+        atividades:
+          type: array
+          items:
+            type: object
+            properties:
+              atividadeId:
+                $ref: '#/components/schemas/Uuid'
+              nomeAtividade:
+                type: string
+              prioridade:
+                $ref: '#/components/schemas/Prioridade'
+              refClienteAtividade:
+                type: [string, 'null']
+              compartilhado:
+                type: boolean
+              tipo:
+                type: [string, 'null']
+              centroCusto:
+                type: [string, 'null']
+              solicitante:
+                type: [string, 'null']
+              dataInicio:
+                type: [string, 'null']
+                format: date-time
+              dataFim:
+                type: [string, 'null']
+                format: date-time
+        equipe:
+          type: array
+          description: Vazio quando visto pela empresa parceira.
+          items:
+            type: object
+            properties:
+              usuarioId:
+                $ref: '#/components/schemas/Uuid'
+              nomeUsuario:
+                type: string
+              nomeCompleto:
+                type: string
+        status:
+          $ref: '#/components/schemas/StatusProjeto'
+        centroCusto:
+          type: [string, 'null']
+        solicitante:
+          type: [string, 'null']
+        tipoProjeto:
+          type: [string, 'null']
+        isActive:
+          type: boolean
+        compartilhado:
+          type: boolean
+    ProjetoInput:
+      type: object
+      properties:
+        nome_projeto:
+          type: string
+        descricao:
+          type: string
+        ref_cliente:
+          type: string
+        data_inicio:
+          type: string
+          format: date
+        data_fim:
+          type: string
+          format: date
+        status:
+          $ref: '#/components/schemas/StatusProjeto'
+        horas_previstas:
+          type: [number, 'null']
+        equipe:
+          type: array
+          items:
+            $ref: '#/components/schemas/Uuid'
+        centro_custo:
+          type: string
+          maxLength: 20
+        solicitante:
+          type: string
+          maxLength: 50
+        tipo:
+          $ref: '#/components/schemas/TipoProjeto'
+    AtividadeListItem:
+      type: object
+      properties:
+        atividadeId:
+          $ref: '#/components/schemas/Uuid'
+        nomeProjeto:
+          type: string
+        nomeAtividade:
+          type: string
+        razaoSocial:
+          type: string
+        previsaoInicio:
+          type: [string, 'null']
+          format: date-time
+        previsaoFim:
+          type: [string, 'null']
+          format: date-time
+        horasPrevistas:
+          type: [number, 'null']
+        refCliente:
+          type: [string, 'null']
+        horasGastas:
+          type: number
+        prioridade:
+          $ref: '#/components/schemas/Prioridade'
+        centroCusto:
+          type: [string, 'null']
+        solicitante:
+          type: [string, 'null']
+        isActive:
+          type: boolean
+        compartilhado:
+          type: boolean
+    AtividadeDetalhe:
+      type: object
+      properties:
+        clienteId:
+          $ref: '#/components/schemas/Uuid'
+        nomeAtividade:
+          type: string
+        descrAtividade:
+          type: [string, 'null']
+        lancamentos:
+          type: array
+          description: Até 5 lançamentos recentes, em snake_case (COLAB vê só os próprios).
+          items:
+            type: object
+            properties:
+              id:
+                $ref: '#/components/schemas/Uuid'
+              usuario_id:
+                $ref: '#/components/schemas/Uuid'
+              data_lancamento:
+                type: string
+                format: date-time
+              hora_inicio:
+                $ref: '#/components/schemas/HoraTime'
+              hora_fim:
+                $ref: '#/components/schemas/HoraTime'
+              duracao_total:
+                type: number
+              descricao:
+                type: [string, 'null']
+              tipo_lancamento:
+                $ref: '#/components/schemas/TipoLancamento'
+        prioridade:
+          $ref: '#/components/schemas/Prioridade'
+        previsaoInicio:
+          type: [string, 'null']
+          format: date-time
+        previsaoFim:
+          type: [string, 'null']
+          format: date-time
+        horasPrevistas:
+          type: [number, 'null']
+        horasGastas:
+          type: number
+        tipoAtividade:
+          type: [string, 'null']
+        refCliente:
+          type: [string, 'null']
+        limiteExcedido:
+          type: boolean
+        projeto:
+          type: object
+          properties:
+            projetoId:
+              $ref: '#/components/schemas/Uuid'
+            status:
+              $ref: '#/components/schemas/StatusProjeto'
+            nomeProjeto:
+              type: string
+            centroCusto:
+              type: [string, 'null']
+            solicitante:
+              type: [string, 'null']
+            cliente:
+              type: object
+              properties:
+                clienteId:
+                  $ref: '#/components/schemas/Uuid'
+                razaoSocial:
+                  type: string
+        centroCusto:
+          type: [string, 'null']
+        solicitante:
+          type: [string, 'null']
+        isActive:
+          type: boolean
+        compartilhado:
+          type: boolean
+    AtividadeInput:
+      type: object
+      properties:
+        nome_atividade:
+          type: string
+        prioridade:
+          $ref: '#/components/schemas/Prioridade'
+        descr_atividade:
+          type: string
+        data_prevista_inicio:
+          type: string
+          format: date
+        data_prevista_fim:
+          type: string
+          format: date
+        horas_previstas:
+          type: number
+        ref_cliente:
+          type: string
+        projeto_id:
+          $ref: '#/components/schemas/Uuid'
+        tipo_atividade:
+          $ref: '#/components/schemas/TipoAtividade'
+        centro_custo:
+          type: string
+          description: Ignorado se o projeto tiver valor (o do projeto prevalece).
+        solicitante:
+          type: string
+          description: Ignorado se o projeto tiver valor (o do projeto prevalece).
+    NovoLancamentoInfo:
+      type: object
+      properties:
+        clientes:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                $ref: '#/components/schemas/Uuid'
+              nome:
+                type: string
+              compartilhado:
+                type: boolean
+        projetos:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                $ref: '#/components/schemas/Uuid'
+              nome:
+                type: string
+              clienteId:
+                $ref: '#/components/schemas/Uuid'
+              limiteAtingido:
+                type: boolean
+              compartilhado:
+                type: boolean
+        atividades:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                $ref: '#/components/schemas/Uuid'
+              nome:
+                type: string
+              projetoId:
+                $ref: '#/components/schemas/Uuid'
+              limiteAtingido:
+                type: boolean
+              compartilhado:
+                type: boolean
+    LancamentoListItem:
+      type: object
+      properties:
+        lancamentoId:
+          $ref: '#/components/schemas/Uuid'
+        nomeAtividade:
+          type: string
+        nomeProjeto:
+          type: string
+        razaoSocial:
+          type: string
+        dataLancamento:
+          type: string
+          format: date-time
+        duracaoTotal:
+          type: number
+        horaInicio:
+          $ref: '#/components/schemas/HoraTime'
+        horaFim:
+          $ref: '#/components/schemas/HoraTime'
+        nomeUsuario:
+          type: string
+    LancamentoDetalhe:
+      type: object
+      properties:
+        descricao:
+          type: [string, 'null']
+        projetoId:
+          $ref: '#/components/schemas/Uuid'
+        atividadeId:
+          $ref: '#/components/schemas/Uuid'
+        dataLancamento:
+          type: string
+          format: date-time
+        horaInicio:
+          $ref: '#/components/schemas/HoraTime'
+        horaFim:
+          $ref: '#/components/schemas/HoraTime'
+        nomeProjeto:
+          type: string
+        nomeUsuario:
+          type: string
+        usuarioId:
+          $ref: '#/components/schemas/Uuid'
+        razaoSocial:
+          type: string
+        clienteId:
+          $ref: '#/components/schemas/Uuid'
+        nomeAtividade:
+          type: string
+        duracao:
+          type: number
+        despesas:
+          type: array
+          maxItems: 0
+          items: {}
+          x-todo: confirmar
+          x-todo-detalhe: Sempre devolvido vazio pelo service.
+    LancamentoInput:
+      type: object
+      required: [atividade_id, cliente_id, projeto_id, data_lancamento, hora_inicio, hora_fim]
+      properties:
+        atividade_id:
+          $ref: '#/components/schemas/Uuid'
+        cliente_id:
+          $ref: '#/components/schemas/Uuid'
+        projeto_id:
+          $ref: '#/components/schemas/Uuid'
+        data_lancamento:
+          type: string
+          format: date
+          description: Não pode ser futura.
+        hora_inicio:
+          $ref: '#/components/schemas/HoraEntrada'
+        hora_fim:
+          $ref: '#/components/schemas/HoraEntrada'
+        descricao:
+          type: string
+    LancamentoDoDia:
+      type: object
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        horaInicio:
+          $ref: '#/components/schemas/HoraTime'
+        horaFim:
+          $ref: '#/components/schemas/HoraTime'
+        cliente:
+          type: string
+        projeto:
+          type: string
+        atividade:
+          type: string
+    DespesaListItem:
+      type: object
+      properties:
+        despesaId:
+          $ref: '#/components/schemas/Uuid'
+        nomeDespesa:
+          type: string
+        descricao:
+          type: [string, 'null']
+        dataDespesa:
+          type: string
+          format: date-time
+        valor:
+          type: number
+        razaoSocial:
+          type: string
+    Administrativo:
+      type: object
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        empresaId:
+          $ref: '#/components/schemas/Uuid'
+        tipo:
+          $ref: '#/components/schemas/TipoAdministrativo'
+        titulo:
+          type: string
+        data_inicio:
+          type: string
+          format: date-time
+        data_fim:
+          type: string
+          format: date-time
+        usuarioId:
+          type: [string, 'null']
+          format: uuid
+    AdministrativoComUsuario:
+      allOf:
+        - $ref: '#/components/schemas/Administrativo'
+        - type: object
+          properties:
+            usuario:
+              type: [object, 'null']
+              properties:
+                id:
+                  $ref: '#/components/schemas/Uuid'
+                nome_usuario:
+                  type: string
+                nome_completo:
+                  type: string
+                email:
+                  type: [string, 'null']
+                is_active:
+                  type: boolean
+    AdministrativoInput:
+      type: object
+      properties:
+        tipo:
+          $ref: '#/components/schemas/TipoAdministrativo'
+        titulo:
+          type: string
+          maxLength: 255
+        usuarioId:
+          $ref: '#/components/schemas/Uuid'
+        data_inicio:
+          type: [string, number]
+          description: Data ISO ou timestamp em ms.
+        data_fim:
+          type: [string, number]
+          description: Data ISO ou timestamp em ms.
+    DashboardStats:
+      type: object
+      properties:
+        contractVersion:
+          type: integer
+          const: 1
+        generatedAt:
+          type: string
+          format: date-time
+        workspaceId:
+          type: string
+        timeEntries:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                $ref: '#/components/schemas/Uuid'
+              employeeId:
+                $ref: '#/components/schemas/Uuid'
+              employeeName:
+                type: string
+              clientId:
+                $ref: '#/components/schemas/Uuid'
+              clientName:
+                type: string
+              projectId:
+                $ref: '#/components/schemas/Uuid'
+              projectName:
+                type: string
+              activityName:
+                type: string
+              date:
+                type: string
+              durationMinutes:
+                type: integer
+              billable:
+                type: boolean
+              approvalStatus:
+                type: 'null'
+        projects:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                $ref: '#/components/schemas/Uuid'
+              name:
+                type: string
+              clientId:
+                $ref: '#/components/schemas/Uuid'
+              clientName:
+                type: string
+              status:
+                type: string
+              deadline:
+                type: [string, 'null']
+              budgetMinutes:
+                type: [integer, 'null']
+              actualMinutes:
+                type: integer
+              memberIds:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Uuid'
+        employees:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                $ref: '#/components/schemas/Uuid'
+              name:
+                type: string
+              role:
+                $ref: '#/components/schemas/Cargo'
+              weeklyCapacityMinutes:
+                type: [integer, 'null']
+        pendingApprovals:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              type:
+                type: string
+                enum: [HOURS, EXPENSE]
+              employeeId:
+                $ref: '#/components/schemas/Uuid'
+              employeeName:
+                type: string
+              submittedAt:
+                type: string
+              summary:
+                type: string
+              durationMinutes:
+                type: [integer, 'null']
+              amountCents:
+                type: [integer, 'null']
+        expenses:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+            properties:
+              id:
+                $ref: '#/components/schemas/Uuid'
+              amountCents:
+                type: integer
+              status:
+                type: string
+                enum: [DRAFT, PENDING, APPROVED, REJECTED, PAID]
+        periodClosures:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              startsOn:
+                type: string
+              endsOn:
+                type: string
+              status:
+                type: string
+                enum: [OPEN, CLOSED]
+              closedAt:
+                type: [string, 'null']
+        clientReports:
+          type: array
+          items:
+            type: object
+            properties:
+              clientId:
+                $ref: '#/components/schemas/Uuid'
+              clientName:
+                type: string
+              period:
+                type: string
+              templateConfigured:
+                type: boolean
+        calendarEntries:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                $ref: '#/components/schemas/Uuid'
+              type:
+                type: string
+              title:
+                type: string
+              startsOn:
+                type: string
+              endsOn:
+                type: string
+              employeeId:
+                type: [string, 'null']
+    FaixaTexto:
+      type: object
+      properties:
+        inicio:
+          type: string
+        fim:
+          type: string
+    RelatorioFiltros:
+      type: object
+      description: |
+        Filtros de faixa (`inicio`/`fim`); cada filtro só é aplicado quando os dois lados vêm preenchidos.
+        Em `tipo=despesas` só `colaborador`, `cliente` e `data` são usados.
+      properties:
+        colaborador:
+          $ref: '#/components/schemas/FaixaTexto'
+        cliente:
+          $ref: '#/components/schemas/FaixaTexto'
+        projeto:
+          $ref: '#/components/schemas/FaixaTexto'
+        atividade:
+          $ref: '#/components/schemas/FaixaTexto'
+        tipoAtividade:
+          $ref: '#/components/schemas/FaixaTexto'
+        data:
+          type: object
+          properties:
+            inicio:
+              type: string
+              format: date
+            fim:
+              type: string
+              format: date
+        colaboradores:
+          type: array
+          description: Só considerado para OWNER/ADMIN; COLAB sempre vê só os próprios.
+          items:
+            $ref: '#/components/schemas/Uuid'
+    RelatorioLancamento:
+      type: object
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        dataLancamento:
+          type: string
+        horaInicio:
+          type: string
+        horaFim:
+          type: string
+        duracaoTotal:
+          type: [number, string]
+        nomeProjeto:
+          type: string
+        horasPrevistas:
+          type: [number, 'null']
+        nomeColaborador:
+          type: string
+        nomeCliente:
+          type: string
+        nomeAtividade:
+          type: string
+        descricao:
+          type: [string, 'null']
+        tipoAtividade:
+          type: [string, 'null']
+        ticketReferencia:
+          type: [string, 'null']
+        centroCusto:
+          type: [string, 'null']
+        solicitante:
+          type: [string, 'null']
+    RelatorioDespesas:
+      type: object
+      properties:
+        mapped:
+          type: array
+          items:
+            type: object
+            properties:
+              despesa_id:
+                $ref: '#/components/schemas/Uuid'
+              data:
+                type: string
+              nomeColaborador:
+                type: string
+              nomeDespesa:
+                type: string
+              valor:
+                type: number
+              lancamentoId:
+                $ref: '#/components/schemas/Uuid'
+              projetoId:
+                $ref: '#/components/schemas/Uuid'
+              nomeProjeto:
+                type: string
+              nomeCliente:
+                type: string
+              descricao:
+                type: [string, 'null']
+              descricaoLancamento:
+                type: [string, 'null']
+        somatorio:
+          type: string
+          description: Soma dos valores com 2 casas decimais.
+          examples:
+            - '123.45'
+    RegistroIntegracao:
+      type: object
+      properties:
+        empresa:
+          type: object
+          properties:
+            nome:
+              type: string
+            identificador:
+              type: string
+        cliente:
+          type: string
+        projeto:
+          type: string
+        atividade:
+          type: string
+        data:
+          type: string
+          description: '`dd/mm/aaaa`.'
+          examples:
+            - 15/10/2026
+        qtd_horas_decimal:
+          type: number
+        descricao:
+          type: [string, 'null']
+        colaborador:
+          type: string
+        ticket_referencia:
+          type: [string, 'null']
+        tipo_atividade:
+          type: [string, 'null']
+        horaInicio:
+          type: string
+        horaFim:
+          type: string
+paths:
+  /auth/login:
+    post:
+      tags: [auth]
+      operationId: authLogin
+      summary: Login com nome de usuário ou e-mail
+      description: Grava os cookies `_tk` e `_rtk`. Na primeira vez cria a `apiKey` do usuário.
+      security: []
+      x-load-weight: pesado
+      x-load-note: argon2id na verificação de senha; rate limit de 10 falhas/15 min por IP.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [nome_usuario, senha]
+              properties:
+                nome_usuario:
+                  type: string
+                  description: Nome de usuário ou e-mail.
+                senha:
+                  type: string
+                  format: password
+            example:
+              nome_usuario: mariana.souza
+              senha: Cr0n0#Track2026
+      responses:
+        '200':
+          description: Autenticado.
+          headers:
+            Set-Cookie:
+              $ref: '#/components/headers/SetAuthCookies'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessMessage'
+              example:
+                error: false
+                message: Bem-vindo!
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: '"Dados inválidos."'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '"Login ou senha inválidos."'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /auth/register:
+    post:
+      tags: [auth]
+      operationId: authRegister
+      summary: Registrar usuário
+      security: []
+      x-load-weight: pesado
+      x-load-note: Hash argon2id; rate limit 10/h por IP.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [nome_usuario, senha, nome_completo, email]
+              properties:
+                nome_usuario:
+                  type: string
+                senha:
+                  type: string
+                  format: password
+                nome_completo:
+                  type: string
+                email:
+                  type: string
+                  format: email
+                identificador:
+                  type: string
+                  description: Ignorado pelo controller.
+            example:
+              nome_usuario: mariana.souza
+              senha: Cr0n0#Track2026
+              nome_completo: Mariana Souza
+              email: mariana.souza@sinosbyte.com.br
+      responses:
+        '201':
+          description: Registrado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessMessage'
+              example:
+                error: false
+                message: Usuário registrado com sucesso.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: '"Dados inválidos." ou "O nome de usuário ou e-mail já está em uso."'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /auth/refresh-token:
+    post:
+      tags: [auth]
+      operationId: authRefreshToken
+      summary: Rotacionar o refresh token e emitir novo `_tk`
+      security:
+        - refreshCookie: []
+      x-load-weight: escrita
+      x-load-note: Revoga o refresh atual e cria outro em transação; rate limit 120/15 min por IP.
+      responses:
+        '200':
+          description: Tokens renovados.
+          headers:
+            Set-Cookie:
+              $ref: '#/components/headers/SetAuthCookies'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessMessage'
+              example:
+                error: false
+                message: Token atualizado.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: '"Refresh token inválido." (cookie ausente).'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '"Refresh token inválido." (revogado, expirado ou usuário inativo).'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+          description: Inclui a corrida de rotação concorrente do mesmo refresh.
+  /auth/logout:
+    post:
+      tags: [auth]
+      operationId: authLogout
+      summary: Encerrar a sessão atual
+      description: Revoga só o refresh enviado (outros dispositivos seguem logados) e limpa os cookies.
+      security:
+        - {}
+        - refreshCookie: []
+      x-load-weight: escrita
+      responses:
+        '200':
+          description: Sessão encerrada.
+          headers:
+            Set-Cookie:
+              $ref: '#/components/headers/ClearAuthCookies'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessMessage'
+              example:
+                error: false
+                message: Logout realizado.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /auth/password-reset:
+    post:
+      tags: [auth]
+      operationId: authPasswordReset
+      summary: Enviar código de recuperação de senha por e-mail
+      description: Código de 8 caracteres hexadecimais guardado em memória por 5 minutos (perdido em restart).
+      security: []
+      x-load-weight: escrita
+      x-load-note: Envia e-mail real pelo Resend; não incluir no mix sem sandbox. Rate limit 5/15 min por IP.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email:
+                  type: string
+                  format: email
+                reset:
+                  type: boolean
+            example:
+              email: mariana.souza@sinosbyte.com.br
+              reset: true
+      responses:
+        '200':
+          description: Código enviado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessMessage'
+              example:
+                error: false
+                message: Código de recuperação enviado para o e-mail cadastrado.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: '"E-mail inválido ou não fornecido."'
+        '404':
+          $ref: '#/components/responses/NotFound'
+          description: '"Este e-mail não pertence a nenhum usuário."'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+          description: Inclui falha no envio do e-mail.
+  /auth/password-reset-verify:
+    post:
+      tags: [auth]
+      operationId: authPasswordResetVerify
+      summary: Validar o código e definir nova senha
+      security: []
+      x-load-weight: pesado
+      x-load-note: Hash argon2id da nova senha; rate limit 10/15 min por IP.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, code, novaSenha]
+              properties:
+                email:
+                  type: string
+                  format: email
+                code:
+                  type: string
+                  pattern: '^[0-9a-f]{8}$'
+                novaSenha:
+                  type: string
+                  minLength: 8
+                  description: Em camelCase (exceção à convenção snake_case).
+            example:
+              email: mariana.souza@sinosbyte.com.br
+              code: 4f9a1c2b
+              novaSenha: N0va#Senha2026
+      responses:
+        '200':
+          description: Senha alterada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessFlag'
+              example:
+                error: false
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: |
+            "Ops! Algo de errado com seu codigo.", "Insira uma senha de no mínimo 8 caracteres.",
+            "Nenhum código de recuperação encontrado ou expirado.", "O código de recuperação expirou."
+            ou "Código de recuperação inválido."
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /auth/me:
+    get:
+      tags: [auth, usuarios]
+      operationId: authMe
+      summary: Dados do usuário logado e empresas vinculadas
+      security:
+        - cookieAuth: []
+      x-load-weight: leitura
+      responses:
+        '200':
+          description: Usuário logado.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: boolean
+                    const: false
+                  data:
+                    $ref: '#/components/schemas/Me'
+              example:
+                error: false
+                data:
+                  id: 3f6c2a1e-8b4d-4c2f-9a7e-1d2b3c4d5e6f
+                  apiKey: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c3VhcmlvX2lkIjoiM2Y2YyJ9.sig
+                  email: mariana.souza@sinosbyte.com.br
+                  isActive: true
+                  nomeCompleto: Mariana Souza
+                  nomeUsuario: mariana.souza
+                  empresas:
+                    - nomeEmpresa: Sinosbyte
+                      identificador: sinosbyte_a1b2
+                      cargo: OWNER
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: Cookie ausente/inválido ou "Não autenticado.".
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /usuarios/list:
+    get:
+      tags: [usuarios]
+      operationId: usuariosList
+      summary: Listar usuários da empresa
+      x-load-weight: leitura
+      x-todo: confirmar
+      x-todo-detalhe: |
+        Qualquer valor de `status` diferente de "all" (inclusive "false") lista só ativos; o filtro `cargo`
+        citado na documentação não é lido pelo código.
+      parameters:
+        - name: status
+          in: query
+          required: false
+          description: '"all" lista todos; ausente ou outro valor lista só os ativos.'
+          schema:
+            type: string
+            examples:
+              - all
+      responses:
+        '200':
+          description: Usuários.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: boolean
+                    const: false
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/UsuarioListItem'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+          description: '"Nenhum usuário encontrado."'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /usuarios/list/{id}:
+    get:
+      tags: [usuarios]
+      operationId: usuariosGetById
+      summary: Detalhe de um usuário da empresa
+      description: COLAB consultando um colega recebe `lancamentos` vazio.
+      x-load-weight: pesado
+      x-load-note: Traz todos os lançamentos do usuário, sem limite nem paginação.
+      parameters:
+        - $ref: '#/components/parameters/IdPath'
+      responses:
+        '200':
+          description: Usuário.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: boolean
+                    const: false
+                  data:
+                    $ref: '#/components/schemas/UsuarioDetalhe'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: '"ID do usuário inválido."'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+          description: '"Usuário não encontrado."'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /usuarios/stats/{usuarioId}:
+    get:
+      tags: [usuarios]
+      operationId: usuariosStats
+      summary: Estatísticas de horas de um usuário
+      description: COLAB só pode consultar as próprias (outro usuário → 404).
+      x-load-weight: pesado
+      x-load-note: Agregações com `$queryRaw`.
+      x-todo: confirmar
+      x-todo-detalhe: |
+        O período usado é `getRangeMonth()` sem argumentos, que resulta no mês anterior; `horasPorProjeto`
+        não filtra período.
+      parameters:
+        - name: usuarioId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Uuid'
+      responses:
+        '200':
+          description: Estatísticas.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: boolean
+                    const: false
+                  data:
+                    $ref: '#/components/schemas/UsuarioStats'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /usuarios/senha:
+    patch:
+      tags: [usuarios]
+      operationId: usuariosAlterarSenha
+      summary: Alterar a própria senha
+      x-load-weight: pesado
+      x-load-note: argon2id verify + hash.
+      x-todo: confirmar
+      x-todo-detalhe: '`senha_nova` ausente não é validado e termina em 500.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [senha_atual, senha_nova]
+              properties:
+                senha_atual:
+                  type: string
+                  format: password
+                senha_nova:
+                  type: string
+                  format: password
+            example:
+              senha_atual: Cr0n0#Track2026
+              senha_nova: N0va#Senha2026
+      responses:
+        '200':
+          description: Senha alterada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessMessage'
+              example:
+                error: false
+                message: Senha atualizada com sucesso.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: '"A senha atual é obrigatória."'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '"Senha atual incorreta."'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /empresas/create:
+    post:
+      tags: [empresas]
+      operationId: empresasCreate
+      summary: Criar empresa (o criador vira OWNER)
+      description: |
+        Exige só o cookie `_tk`. Corpo em camelCase. Sem `identificador`, gera nome em minúsculas com o
+        primeiro espaço trocado por `_` e 4 caracteres hexadecimais no fim.
+      security:
+        - cookieAuth: []
+      x-load-weight: escrita
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [nomeEmpresa]
+              properties:
+                nomeEmpresa:
+                  type: string
+                identificador:
+                  type: string
+            example:
+              nomeEmpresa: Sinosbyte Consultoria
+              identificador: sinosbyte_consultoria
+      responses:
+        '201':
+          description: Empresa criada (resposta sem o campo `error`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageOnly'
+              example:
+                message: Empresa criada com sucesso!
+        '400':
+          description: '"O nome da empresa é obrigatório." ou "Uma empresa ja esta registrada com este nome!"'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageOnly'
+              example:
+                message: O nome da empresa é obrigatório.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+          description: Inclui `identificador` duplicado.
+  /empresas/usuario/add/{email}:
+    post:
+      tags: [empresas]
+      operationId: empresasAddUsuario
+      summary: Adicionar usuário à empresa (desativada)
+      security:
+        - cookieAuth: []
+      x-load-weight: escrita
+      x-load-note: Não toca no banco; sempre 400. Fora do mix.
+      x-todo: confirmar
+      x-todo-detalhe: Função desativada no controller; avaliar remoção da rota.
+      parameters:
+        - name: email
+          in: path
+          required: true
+          schema:
+            type: string
+            format: email
+      responses:
+        '400':
+          description: Sempre responde assim.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageOnly'
+              example:
+                message: Funcao Indisponivel no momento
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /empresas/usuario/remove/{id}:
+    delete:
+      tags: [empresas]
+      operationId: empresasRemoveUsuario
+      summary: Remover usuário da empresa
+      x-load-weight: escrita
+      x-todo: confirmar
+      x-todo-detalhe: '`id` não é validado como uuid; alvo sem vínculo ou id inválido termina em 500; sucesso responde `{}`.'
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Id do usuário a remover.
+          schema:
+            $ref: '#/components/schemas/Uuid'
+      responses:
+        '200':
+          description: Removido (corpo vazio `{}`).
+          content:
+            application/json:
+              schema:
+                type: object
+              example: {}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: '"Não é possível remover este usuário!" (alvo OWNER) ou "Voce nao pode remover usuários da empresa!" (ator COLAB).'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /empresas/delete:
+    delete:
+      tags: [empresas]
+      operationId: empresasDelete
+      summary: Excluir a empresa do `x-workspace-id`
+      description: Só OWNER. Exclusão em cascata de todos os dados da empresa.
+      x-load-weight: pesado
+      x-load-note: Destrutivo; nunca incluir no mix de carga.
+      responses:
+        '200':
+          description: Empresa excluída.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessMessage'
+              example:
+                error: false
+                message: Empresa deletada com sucesso!
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: '"Apenas Owners podem deletar a empresa." ou "Empresa não encontrada."'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /convite/create:
+    post:
+      tags: [convite]
+      operationId: conviteCreate
+      summary: Convidar pessoa por e-mail para a empresa
+      x-load-weight: escrita
+      x-load-note: Envia e-mail real pelo Resend; rate limit 15/h por usuário.
+      x-todo: confirmar
+      x-todo-detalhe: Não há checagem de cargo (quem pode convidar ainda não foi decidido).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [nome, email]
+              properties:
+                nome:
+                  type: string
+                email:
+                  type: string
+                  format: email
+            example:
+              nome: Rafael Lima
+              email: rafael.lima@metalurgicavale.com.br
+      responses:
+        '200':
+          description: Convite enviado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessMessage'
+              example:
+                error: false
+                message: Convite enviado com sucesso!
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: '"Nome e e-mail são obrigatórios." ou "Este usuário já faz parte desta empresa."'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+          description: Inclui falha no envio do e-mail.
+  /convite/aceite/{token}:
+    get:
+      tags: [convite]
+      operationId: conviteAceiteRedirect
+      summary: Link do e-mail de convite (redireciona ao front)
+      security: []
+      x-load-weight: leitura
+      x-todo: confirmar
+      x-todo-detalhe: |
+        A rota é pública e `req.user` nunca é preenchido nela, então o ramo "usuário logado aceita direto"
+        do controller nunca executa.
+      parameters:
+        - name: token
+          in: path
+          required: true
+          description: JWT do convite (validade de 2 dias).
+          schema:
+            type: string
+      responses:
+        '302':
+          description: |
+            Redireciona para `${FRONTEND_URL}/login?email&nome&nome_empresa&isNewUser&tk`; em erro de convite,
+            para `${FRONTEND_URL}/login?<code>=true` (ex.: `inviteExpired=true`).
+          headers:
+            Location:
+              schema:
+                type: string
+                format: uri
+            Cache-Control:
+              schema:
+                type: string
+                const: no-store
+            Referrer-Policy:
+              schema:
+                type: string
+                const: no-referrer
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /convite/aceitar/{token}:
+    post:
+      tags: [convite]
+      operationId: conviteAceitar
+      summary: Aceitar convite com o usuário logado
+      security:
+        - cookieAuth: []
+      x-load-weight: escrita
+      parameters:
+        - name: token
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Convite aceito.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessMessage'
+              example:
+                error: false
+                message: Convite aceito com sucesso!
+        '400':
+          description: '`inviteExpired` ou `inviteInvalid`.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InviteErrorResponse'
+              example:
+                error: true
+                code: inviteExpired
+                message: Este convite expirou.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: '`accountInactive` ou `inviteAccountMismatch`.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InviteErrorResponse'
+        '404':
+          description: '`inviteUnavailable`.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InviteErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /clientes/list:
+    get:
+      tags: [clientes]
+      operationId: clientesList
+      summary: Listar clientes da empresa (e os compartilhados por parceria)
+      x-load-weight: leitura
+      parameters:
+        - name: is_active
+          in: query
+          required: false
+          description: Ausente ou "all" lista todos; qualquer outro valor lista só os ativos.
+          schema:
+            type: string
+            examples:
+              - all
+      responses:
+        '200':
+          description: Clientes.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: boolean
+                    const: false
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ClienteListItem'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /clientes/list/{id}:
+    get:
+      tags: [clientes]
+      operationId: clientesGetById
+      summary: Detalhe do cliente com projetos e totais
+      description: COLAB vê só as próprias horas/despesas nos totais.
+      x-load-weight: leitura
+      parameters:
+        - $ref: '#/components/parameters/IdPath'
+      responses:
+        '200':
+          description: Cliente.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: boolean
+                    const: false
+                  data:
+                    $ref: '#/components/schemas/ClienteDetalhe'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: '"ID do cliente inválido."'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+          description: '"Cliente não encontrado."'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /clientes/{id}/projetos:
+    get:
+      tags: [clientes]
+      operationId: clientesListProjetos
+      summary: Projetos de um cliente (linhas do banco em snake_case)
+      x-load-weight: leitura
+      parameters:
+        - $ref: '#/components/parameters/IdPath'
+      responses:
+        '200':
+          description: Projetos.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: boolean
+                    const: false
+                  data:
+                    type: object
+                    properties:
+                      projetos:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/ProjetoRow'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+          description: '"Cliente não encontrado ou não pertence a esta empresa."'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /clientes/create:
+    post:
+      tags: [clientes]
+      operationId: clientesCreate
+      summary: Criar cliente
+      x-load-weight: escrita
+      x-load-note: '`cnpj`, `razao_social` e `email` são únicos globalmente: gere valores únicos por iteração.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/ClienteInput'
+                - required: [cnpj, razao_social]
+            example:
+              cnpj: 12.345.678/0001-90
+              razao_social: Metalúrgica Vale do Sinos Ltda.
+              nome_fantasia: Metalúrgica Vale
+              email: financeiro@metalurgicavale.com.br
+              cep: 93010-000
+              endereco: Rua Independência, 1200
+              cidade: São Leopoldo
+              estado: RS
+              inscricao_estadual: '1234567890'
+              nota_interna: Faturamento até o dia 5.
+              pais: Brasil
+              website: https://metalurgicavale.com.br
+      responses:
+        '201':
+          description: Cliente criado.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: boolean
+                    const: false
+                  data:
+                    type: object
+                    properties:
+                      cliente:
+                        $ref: '#/components/schemas/ParceiroRow'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: '"CNPJ e Razão Social são obrigatórios."'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+          description: '"CNPJ já existente"'
+        '500':
+          $ref: '#/components/responses/InternalError'
+          description: Inclui `razao_social` ou `email` duplicados.
+  /clientes/edit/{id}:
+    put:
+      tags: [clientes]
+      operationId: clientesUpdate
+      summary: Editar cliente
+      x-load-weight: escrita
+      x-todo: confirmar
+      x-todo-detalhe: |
+        `razao_social` não é gravado; `status: true` sem `nome_fantasia`/`razao_social` só altera `is_active`;
+        omitir `identificador_parceiro` apaga a parceria existente.
+      parameters:
+        - $ref: '#/components/parameters/IdPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/ClienteInput'
+                - type: object
+                  properties:
+                    status:
+                      type: boolean
+                    identificador_parceiro:
+                      type: [string, 'null']
+                      description: '`identificador` da empresa parceira.'
+            example:
+              cnpj: 12.345.678/0001-90
+              razao_social: Metalúrgica Vale do Sinos Ltda.
+              nome_fantasia: Metalúrgica Vale
+              email: financeiro@metalurgicavale.com.br
+              cidade: Novo Hamburgo
+              estado: RS
+              status: true
+              identificador_parceiro: metalurgica_vale7c3d
+      responses:
+        '200':
+          description: Cliente atualizado.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: boolean
+                    const: false
+                  data:
+                    type: object
+              example:
+                error: false
+                data: {}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+          description: '"Cliente não encontrado ou não pertence a esta empresa." ou "Empresa nao encontrada para o identificador informado"'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /clientes/delete/{id}:
+    delete:
+      tags: [clientes]
+      operationId: clientesDelete
+      summary: Excluir cliente
+      x-load-weight: escrita
+      x-todo: confirmar
+      x-todo-detalhe: Cliente com lançamentos esbarra em FK (NoAction) e termina em 500.
+      parameters:
+        - $ref: '#/components/parameters/IdPath'
+      responses:
+        '200':
+          description: Excluído.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessMessage'
+              example:
+                error: false
+                message: Cliente excluído com sucesso.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /partner/{projetoId}/{clienteId}:
+    parameters:
+      - name: projetoId
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/Uuid'
+      - name: clienteId
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/Uuid'
+    post:
+      tags: [parceria]
+      operationId: partnerShare
+      summary: Compartilhar projeto e atividades com a empresa parceira do cliente
+      x-load-weight: escrita
+      x-todo: confirmar
+      x-todo-detalhe: Lista vazia compartilha o projeto e desmarca todas as atividades.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [atividades]
+              properties:
+                atividades:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/Uuid'
+            example:
+              atividades:
+                - 9b2e4f60-1a3c-4d5e-8f70-a1b2c3d4e5f6
+                - c4d5e6f7-0819-4a2b-9c3d-4e5f60718293
+      responses:
+        '200':
+          description: Compartilhamento configurado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessMessage'
+              example:
+                error: false
+                message: Compartilhamento configurado com sucesso.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: '"Parametros incorretos!" ou "Uma ou mais atividades não pertencem a este projeto."'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+          description: '"Projeto não encontrado ou não pertence a esta empresa/cliente."'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags: [parceria]
+      operationId: partnerUnshare
+      summary: Remover compartilhamento (do projeto ou das atividades informadas)
+      x-load-weight: escrita
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                atividades:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/Uuid'
+            example:
+              atividades:
+                - 9b2e4f60-1a3c-4d5e-8f70-a1b2c3d4e5f6
+      responses:
+        '200':
+          description: Compartilhamento removido.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessMessage'
+              example:
+                error: false
+                message: Compartilhamento removido com sucesso.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: '"projetoId e clienteId são obrigatórios." ou "Parametros incorretos!"'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /projetos/list:
+    get:
+      tags: [projetos]
+      operationId: projetosList
+      summary: Listar projetos (próprios e compartilhados)
+      x-load-weight: leitura
+      x-load-note: Consulta extra por projeto compartilhado (N+1).
+      responses:
+        '200':
+          description: Projetos.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: boolean
+                    const: false
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ProjetoListItem'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /projetos/list/{id}:
+    get:
+      tags: [projetos]
+      operationId: projetosGetById
+      summary: Detalhe do projeto
+      x-load-weight: leitura
+      parameters:
+        - $ref: '#/components/parameters/IdPath'
+      responses:
+        '200':
+          description: Projeto.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: boolean
+                    const: false
+                  data:
+                    $ref: '#/components/schemas/ProjetoDetalhe'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: '"ID do projeto inválido."'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+          description: '"Projeto não encontrado."'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /projetos/create:
+    post:
+      tags: [projetos]
+      operationId: projetosCreate
+      summary: Criar projeto
+      x-load-weight: escrita
+      x-todo: confirmar
+      x-todo-detalhe: Na criação, os ids de `equipe` não são conferidos contra a empresa.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/ProjetoInput'
+                - type: object
+                  required: [cliente_id, nome_projeto, data_inicio, data_fim]
+                  properties:
+                    cliente_id:
+                      $ref: '#/components/schemas/Uuid'
+            example:
+              cliente_id: 5d1e2f3a-4b5c-4d6e-8f9a-0b1c2d3e4f5a
+              nome_projeto: Implantação ERP - Fase 2
+              descricao: Migração dos módulos fiscal e estoque.
+              ref_cliente: PED-2026-0412
+              data_inicio: '2026-09-01'
+              data_fim: '2026-12-18'
+              status: EmAndamento
+              horas_previstas: 320
+              equipe:
+                - 3f6c2a1e-8b4d-4c2f-9a7e-1d2b3c4d5e6f
+                - 7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d
+              centro_custo: CC-1020
+              solicitante: Carlos Mendes
+              tipo: ORCADO
+      responses:
+        '201':
+          description: Projeto criado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessMessage'
+              example:
+                error: false
+                message: Projeto criado com sucesso.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: |
+            "Campos obrigatórios: Nome, Data Início, Data Fim.", "Data Fim não pode ser anterior à Data Início."
+            ou "Cliente é obrigatório para criar um projeto."
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+          description: Cliente não encontrado na empresa.
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /projetos/edit/{id}:
+    put:
+      tags: [projetos]
+      operationId: projetosUpdate
+      summary: Editar projeto
+      x-load-weight: escrita
+      x-todo: confirmar
+      x-todo-detalhe: |
+        O cliente vem em `clienteId` (camelCase, diferente do create); omitir `horas_previstas` grava `null`;
+        `is_active: true` sem `nome_projeto` só reativa o projeto.
+      parameters:
+        - $ref: '#/components/parameters/IdPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/ProjetoInput'
+                - type: object
+                  properties:
+                    clienteId:
+                      $ref: '#/components/schemas/Uuid'
+                    is_active:
+                      type: boolean
+            example:
+              clienteId: 5d1e2f3a-4b5c-4d6e-8f9a-0b1c2d3e4f5a
+              nome_projeto: Implantação ERP - Fase 2
+              descricao: Migração dos módulos fiscal, estoque e compras.
+              data_inicio: '2026-09-01'
+              data_fim: '2027-01-29'
+              status: EmAndamento
+              horas_previstas: 400
+              equipe:
+                - 3f6c2a1e-8b4d-4c2f-9a7e-1d2b3c4d5e6f
+              ref_cliente: PED-2026-0412
+              centro_custo: CC-1020
+              solicitante: Carlos Mendes
+              tipo: ORCADO
+              is_active: true
+      responses:
+        '200':
+          description: Projeto atualizado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessMessage'
+              example:
+                error: false
+                message: Projeto atualizado com sucesso.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+          description: Projeto ou cliente não encontrado, ou "Colaboradores não pertence a esta empresa."
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /projetos/delete/{id}:
+    delete:
+      tags: [projetos]
+      operationId: projetosDelete
+      summary: Excluir projeto
+      x-load-weight: escrita
+      parameters:
+        - $ref: '#/components/parameters/IdPath'
+      responses:
+        '200':
+          description: Excluído.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessMessage'
+              example:
+                error: false
+                message: Projeto excluído com sucesso.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: '"Não é possível excluir: este projeto possui atividades, lançamentos de horas ou despesas vinculadas."'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /atividades/list:
+    get:
+      tags: [atividades]
+      operationId: atividadesList
+      summary: Listar atividades
+      x-load-weight: leitura
+      x-todo: confirmar
+      x-todo-detalhe: '`projeto_id` não é validado como uuid; valor inválido termina em 500.'
+      parameters:
+        - name: projeto_id
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/Uuid'
+      responses:
+        '200':
+          description: Atividades.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: boolean
+                    const: false
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AtividadeListItem'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /atividades/list/{id}:
+    get:
+      tags: [atividades]
+      operationId: atividadesGetById
+      summary: Detalhe da atividade com até 5 lançamentos recentes
+      x-load-weight: leitura
+      parameters:
+        - $ref: '#/components/parameters/IdPath'
+      responses:
+        '200':
+          description: Atividade.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: boolean
+                    const: false
+                  data:
+                    $ref: '#/components/schemas/AtividadeDetalhe'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: '"ID inválido."'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+          description: '"Atividade não encontrada ou não pertence a esta empresa."'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /atividades/create:
+    post:
+      tags: [atividades]
+      operationId: atividadesCreate
+      summary: Criar atividade
+      x-load-weight: escrita
+      x-todo: confirmar
+      x-todo-detalhe: |
+        Não há validação no controller; campos ausentes terminam em 500. Obrigatórios efetivos:
+        `nome_atividade`, `data_prevista_inicio`, `data_prevista_fim` e `projeto_id`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/AtividadeInput'
+                - required: [nome_atividade, data_prevista_inicio, data_prevista_fim, projeto_id]
+            example:
+              nome_atividade: Parametrização do módulo fiscal
+              prioridade: ALTA
+              descr_atividade: Configurar CFOPs e regras de ICMS-ST.
+              data_prevista_inicio: '2026-09-08'
+              data_prevista_fim: '2026-10-09'
+              horas_previstas: 80
+              ref_cliente: CH-88231
+              projeto_id: 2c3d4e5f-6a7b-4c8d-9e0f-1a2b3c4d5e6f
+              tipo_atividade: ORCADO
+              centro_custo: CC-1020
+              solicitante: Carlos Mendes
+      responses:
+        '201':
+          description: Atividade criada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessMessage'
+              example:
+                error: false
+                message: Atividade criada com sucesso.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+          description: '"Projeto não encontrado ou não pertence a esta empresa."'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /atividades/edit/{id}:
+    put:
+      tags: [atividades]
+      operationId: atividadesUpdate
+      summary: Editar atividade
+      x-load-weight: escrita
+      x-todo: confirmar
+      x-todo-detalhe: |
+        `prioridade` é ignorada; `horas_previstas` ausente vira `NaN`; `is_active` só é aplicado quando
+        `nome_atividade` não é enviado.
+      parameters:
+        - $ref: '#/components/parameters/IdPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/AtividadeInput'
+                - type: object
+                  properties:
+                    is_active:
+                      type: boolean
+            example:
+              nome_atividade: Parametrização do módulo fiscal
+              descr_atividade: Configurar CFOPs, ICMS-ST e DIFAL.
+              data_prevista_inicio: '2026-09-08'
+              data_prevista_fim: '2026-10-16'
+              horas_previstas: 96
+              ref_cliente: CH-88231
+              projeto_id: 2c3d4e5f-6a7b-4c8d-9e0f-1a2b3c4d5e6f
+              tipo_atividade: ORCADO
+      responses:
+        '200':
+          description: Atividade atualizada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessMessage'
+              example:
+                error: false
+                message: Atividade atualizada com sucesso!
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: '"ID inválido."'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /atividades/delete/{id}:
+    delete:
+      tags: [atividades]
+      operationId: atividadesDelete
+      summary: Excluir atividade
+      x-load-weight: escrita
+      parameters:
+        - $ref: '#/components/parameters/IdPath'
+      responses:
+        '200':
+          description: Excluída.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessMessage'
+              example:
+                error: false
+                message: Atividade excluída com sucesso.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: '"Atividades com horas lançadas não podem ser excluídas."'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+          description: '"Atividade não existe ou não pertence a esta empresa."'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /lancamentos/new-info:
+    get:
+      tags: [lancamentos]
+      operationId: lancamentosNewInfo
+      summary: Opções de cliente, projeto e atividade para um novo lançamento
+      x-load-weight: leitura
+      responses:
+        '200':
+          description: Opções.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: boolean
+                    const: false
+                  data:
+                    $ref: '#/components/schemas/NovoLancamentoInfo'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /lancamentos/list:
+    get:
+      tags: [lancamentos]
+      operationId: lancamentosList
+      summary: Listar lançamentos do mês (próprios ou da equipe)
+      x-load-weight: leitura
+      x-todo: confirmar
+      x-todo-detalhe: |
+        `mes` é 1-based quando enviado, mas o padrão é `new Date().getMonth()` (0-based), o que resulta no mês
+        anterior; `projeto_id` não é validado; `limit` e `cargoOwner` são ignorados.
+      parameters:
+        - name: from
+          in: query
+          required: false
+          description: '"all" lista os da empresa (só OWNER/ADMIN; COLAB recebe 403).'
+          schema:
+            type: string
+            enum: [all]
+        - name: projeto_id
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/Uuid'
+        - name: ano
+          in: query
+          required: false
+          schema:
+            type: integer
+            examples:
+              - 2026
+        - name: mes
+          in: query
+          required: false
+          description: 1 a 12.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 12
+            examples:
+              - 10
+      responses:
+        '200':
+          description: Lançamentos e total do período.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: boolean
+                    const: false
+                  data:
+                    type: object
+                    properties:
+                      total:
+                        $ref: '#/components/schemas/HorasHHmm'
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/LancamentoListItem'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '"Apenas gerentes ou administradores podem visualizar lançamentos de toda a equipe."'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /lancamentos/list/{id}:
+    get:
+      tags: [lancamentos]
+      operationId: lancamentosGetById
+      summary: Detalhe do lançamento
+      x-load-weight: leitura
+      parameters:
+        - $ref: '#/components/parameters/IdPath'
+      responses:
+        '200':
+          description: Lançamento.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: boolean
+                    const: false
+                  data:
+                    $ref: '#/components/schemas/LancamentoDetalhe'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: '"ID do lançamento inválido."'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+          description: '"Lançamento não encontrado ou não pertence a esta empresa."'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /lancamentos/create:
+    post:
+      tags: [lancamentos]
+      operationId: lancamentosCreate
+      summary: Registrar lançamento de horas
+      description: Em transação; valida origem (atividade/projeto/cliente), sobreposição e atualiza `horas_gastas`.
+      x-load-weight: escrita
+      x-load-note: Use horários distintos por usuário/iteração para não cair na regra de sobreposição (400).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/LancamentoInput'
+                - type: object
+                  properties:
+                    type:
+                      type: string
+                      description: Ignorado.
+            example:
+              atividade_id: 9b2e4f60-1a3c-4d5e-8f70-a1b2c3d4e5f6
+              cliente_id: 5d1e2f3a-4b5c-4d6e-8f9a-0b1c2d3e4f5a
+              projeto_id: 2c3d4e5f-6a7b-4c8d-9e0f-1a2b3c4d5e6f
+              data_lancamento: '2026-10-14'
+              hora_inicio: '08:00'
+              hora_fim: '12:00'
+              descricao: Configuração das regras de ICMS-ST para SP e RS.
+      responses:
+        '201':
+          description: Lançamento registrado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessMessage'
+              example:
+                error: false
+                message: Lançamento registrado com sucesso
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: |
+            "Dados obrigatórios ausentes.", "Atividade, projeto ou cliente ausente ou inválido.",
+            "Data ou horários inválidos.", "O horário de fim deve ser maior que o horário de início.",
+            "Não é permitido lançar horas em datas futuras", "Projeto ou cliente não correspondem à atividade
+            informada." ou "Já existe um lançamento registrado entre 08:00 e 09:00".
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+          description: '"Atividade não encontrada ou não pertence a esta empresa."'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /lancamentos/edit/{id}:
+    put:
+      tags: [lancamentos]
+      operationId: lancamentosUpdate
+      summary: Editar lançamento de horas
+      x-load-weight: escrita
+      parameters:
+        - $ref: '#/components/parameters/IdPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/LancamentoInput'
+                - type: object
+                  properties:
+                    motivo_edicao:
+                      type: string
+            example:
+              atividade_id: 9b2e4f60-1a3c-4d5e-8f70-a1b2c3d4e5f6
+              cliente_id: 5d1e2f3a-4b5c-4d6e-8f9a-0b1c2d3e4f5a
+              projeto_id: 2c3d4e5f-6a7b-4c8d-9e0f-1a2b3c4d5e6f
+              data_lancamento: '2026-10-14'
+              hora_inicio: '08:30'
+              hora_fim: '12:00'
+              descricao: Configuração das regras de ICMS-ST para SP e RS.
+              motivo_edicao: Ajuste do horário de início.
+      responses:
+        '200':
+          description: Lançamento atualizado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessMessage'
+              example:
+                error: false
+                message: Lançamento atualizado com sucesso.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: |
+            "ID inválido.", "Atividade e horários são obrigatórios.", validações de data/horário iguais às do
+            create ou "Você já possui um lançamento neste espaço de tempo".
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /lancamentos/delete/{id}:
+    delete:
+      tags: [lancamentos]
+      operationId: lancamentosDelete
+      summary: Excluir lançamento (despesas vinculadas são excluídas em cascata)
+      x-load-weight: escrita
+      parameters:
+        - $ref: '#/components/parameters/IdPath'
+      responses:
+        '200':
+          description: Excluído.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessMessage'
+              example:
+                error: false
+                message: Lançamento excluído com sucesso.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /despesas/lancamentos/dia:
+    get:
+      tags: [despesas]
+      operationId: despesasLancamentosDoDia
+      summary: Lançamentos do usuário numa data (para vincular despesa)
+      x-load-weight: leitura
+      x-todo: confirmar
+      x-todo-detalhe: Data em formato inválido termina em 500.
+      parameters:
+        - name: data
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+            examples:
+              - '2026-10-14'
+      responses:
+        '200':
+          description: Lançamentos.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: boolean
+                    const: false
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/LancamentoDoDia'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: '"Data é obrigatória."'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /despesas/list:
+    get:
+      tags: [despesas]
+      operationId: despesasList
+      summary: Listar despesas do usuário logado
+      x-load-weight: leitura
+      x-todo: confirmar
+      x-todo-detalhe: Sempre lista só as do próprio usuário, inclusive para OWNER/ADMIN.
+      parameters:
+        - name: data_inicio
+          in: query
+          required: false
+          description: Só aplicado junto com `data_fim`.
+          schema:
+            type: string
+            format: date
+        - name: data_fim
+          in: query
+          required: false
+          description: Só aplicado junto com `data_inicio`.
+          schema:
+            type: string
+            format: date
+      responses:
+        '200':
+          description: Despesas.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: boolean
+                    const: false
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/DespesaListItem'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /despesas/list/{id}:
+    get:
+      tags: [despesas]
+      operationId: despesasListById
+      summary: Mesmo handler de /despesas/list (o id é ignorado)
+      x-load-weight: leitura
+      x-todo: confirmar
+      x-todo-detalhe: A rota existe no router, mas o `:id` não é lido; devolve a mesma lista de /despesas/list.
+      parameters:
+        - $ref: '#/components/parameters/IdPath'
+        - name: data_inicio
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date
+        - name: data_fim
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date
+      responses:
+        '200':
+          description: Despesas.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: boolean
+                    const: false
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/DespesaListItem'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /despesas/create:
+    post:
+      tags: [despesas]
+      operationId: despesasCreate
+      summary: Criar despesa vinculada a um lançamento
+      x-load-weight: escrita
+      x-todo: confirmar
+      x-todo-detalhe: Sem `lancamento_id`, o lançamento do dia é buscado por igualdade exata do timestamp de `data_lancamento`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [nome_despesa, valor, data_despesa]
+              properties:
+                nome_despesa:
+                  type: string
+                descricao:
+                  type: string
+                valor:
+                  type: [number, string]
+                  description: Maior que zero.
+                data_despesa:
+                  type: string
+                  format: date
+                lancamento_id:
+                  $ref: '#/components/schemas/Uuid'
+            example:
+              nome_despesa: Deslocamento até o cliente
+              descricao: Uber São Leopoldo → Novo Hamburgo (ida e volta).
+              valor: 86.4
+              data_despesa: '2026-10-14'
+              lancamento_id: e1f2a3b4-c5d6-4e7f-8a9b-0c1d2e3f4a5b
+      responses:
+        '201':
+          description: Despesa criada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessMessage'
+              example:
+                error: false
+                message: Despesa adicionada!
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: |
+            "Nome da despesa, valor e data são obrigatórios.", "Lançamento inválido.", "Valor inválido.",
+            "É necessário ter um lançamento de horas nessa data para criar uma despesa." ou
+            "Há mais de um lançamento nessa data: informe o lançamento da despesa."
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /despesas/delete/{id}:
+    delete:
+      tags: [despesas]
+      operationId: despesasDelete
+      summary: Excluir despesa
+      x-load-weight: escrita
+      parameters:
+        - $ref: '#/components/parameters/IdPath'
+      responses:
+        '200':
+          description: Excluída.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessMessage'
+              example:
+                error: false
+                message: Despesa deletada com sucesso.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: '"ID da despesa inválido."'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+          description: '"Despesa não encontrada."'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /administrativo/list:
+    get:
+      tags: [administrativo]
+      operationId: administrativoList
+      summary: Listar férias, faltas e eventos (COLAB vê só os próprios)
+      x-load-weight: leitura
+      responses:
+        '200':
+          description: Eventos.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: boolean
+                    const: false
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AdministrativoComUsuario'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /administrativo/create:
+    post:
+      tags: [administrativo]
+      operationId: administrativoCreate
+      summary: Criar férias, falta ou evento
+      description: '`usuarioId` em camelCase; padrão = usuário logado. FERIAS/FALTA não podem se sobrepor.'
+      x-load-weight: escrita
+      x-todo: confirmar
+      x-todo-detalhe: Sem restrição de cargo (quem pode gerir `administrativo` ainda não foi decidido).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/AdministrativoInput'
+                - required: [titulo, data_inicio, data_fim]
+            example:
+              tipo: FERIAS
+              titulo: Férias de fim de ano
+              usuarioId: 7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d
+              data_inicio: '2026-12-21'
+              data_fim: '2027-01-08'
+      responses:
+        '201':
+          description: Evento criado.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: boolean
+                    const: false
+                  message:
+                    type: string
+                  data:
+                    $ref: '#/components/schemas/Administrativo'
+              example:
+                error: false
+                message: Evento inserido com sucesso.
+                data:
+                  id: 0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d
+                  empresaId: 6e7f8a9b-0c1d-4e2f-8a3b-4c5d6e7f8a9b
+                  tipo: FERIAS
+                  titulo: Férias de fim de ano
+                  data_inicio: '2026-12-21T00:00:00.000Z'
+                  data_fim: '2027-01-08T00:00:00.000Z'
+                  usuarioId: 7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: |
+            "Título inválido.", "Usuário inválido.", "Datas inválidas.", "Tipo de evento inválido.",
+            "Usuário informado não pertence a esta empresa.", "A data de início não pode ser posterior à data
+            de fim." ou "Impossível criar ou atualizar este evento!" (conflito).
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /administrativo/edit/{id}:
+    put:
+      tags: [administrativo]
+      operationId: administrativoUpdate
+      summary: Editar evento (só os campos enviados)
+      x-load-weight: escrita
+      parameters:
+        - $ref: '#/components/parameters/IdPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdministrativoInput'
+            example:
+              titulo: Férias de fim de ano (ajustadas)
+              data_fim: '2027-01-15'
+      responses:
+        '200':
+          description: Evento atualizado.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: boolean
+                    const: false
+                  message:
+                    type: string
+                  data:
+                    $ref: '#/components/schemas/Administrativo'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: '"ID do evento inválido." e as mesmas validações do create.'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+          description: '"Evento administrativo não encontrado."'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /administrativo/delete/{id}:
+    delete:
+      tags: [administrativo]
+      operationId: administrativoDelete
+      summary: Excluir evento
+      x-load-weight: escrita
+      parameters:
+        - $ref: '#/components/parameters/IdPath'
+      responses:
+        '200':
+          description: Excluído.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessFlag'
+              example:
+                error: false
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /dashboard/stats:
+    get:
+      tags: [dashboard]
+      operationId: dashboardStats
+      summary: Dados consolidados do painel (contrato v1)
+      x-load-weight: pesado
+      x-load-note: Lê lançamentos, projetos, despesas e eventos da empresa sem filtro de período.
+      responses:
+        '200':
+          description: Painel.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: boolean
+                    const: false
+                  message:
+                    type: string
+                  data:
+                    $ref: '#/components/schemas/DashboardStats'
+              example:
+                error: false
+                message: Dashboard carregado.
+                data:
+                  contractVersion: 1
+                  generatedAt: '2026-10-15T13:20:00.000Z'
+                  workspaceId: sinosbyte_a1b2
+                  timeEntries: []
+                  projects: []
+                  employees: []
+                  pendingApprovals: []
+                  expenses: []
+                  periodClosures: []
+                  clientReports: []
+                  calendarEntries: []
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+          description: '"Workspace não encontrado."'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /relatorios/list:
+    post:
+      tags: [relatorios]
+      operationId: relatoriosList
+      summary: Relatório de lançamentos ou despesas (JSON ou XLSX)
+      description: Mesmo handler de `POST /relatorios/files`. COLAB vê só os próprios dados.
+      x-load-weight: pesado
+      x-load-note: Consulta sem paginação; com `filext` gera planilha ExcelJS em memória.
+      x-todo: confirmar
+      x-todo-detalhe: '`filext=pdf` gera conteúdo XLSX com extensão .pdf.'
+      parameters:
+        - $ref: '#/components/parameters/RelatorioTipo'
+        - $ref: '#/components/parameters/RelatorioFilext'
+      requestBody:
+        $ref: '#/components/requestBodies/RelatorioFiltros'
+      responses:
+        '202':
+          $ref: '#/components/responses/RelatorioOk'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: '"Lista de colaboradores inválida."'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: Inclui "Não autenticado.".
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+          description: Inclui "Impossível completar o arquivo!".
+  /relatorios/files:
+    post:
+      tags: [relatorios]
+      operationId: relatoriosFiles
+      summary: Relatório de lançamentos ou despesas (mesmo handler de /relatorios/list)
+      x-load-weight: pesado
+      x-load-note: Consulta sem paginação; com `filext` gera planilha ExcelJS em memória.
+      x-todo: confirmar
+      x-todo-detalhe: Rota duplicada de `/relatorios/list`; `filext=pdf` gera conteúdo XLSX com extensão .pdf.
+      parameters:
+        - $ref: '#/components/parameters/RelatorioTipo'
+        - $ref: '#/components/parameters/RelatorioFilext'
+      requestBody:
+        $ref: '#/components/requestBodies/RelatorioFiltros'
+      responses:
+        '202':
+          $ref: '#/components/responses/RelatorioOk'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: '"Lista de colaboradores inválida."'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/relatorios/registro:
+    get:
+      tags: [integracao]
+      operationId: apiRelatoriosRegistro
+      summary: Registros de horas para integração externa
+      description: 'Aceita `Authorization: Bearer <apiKey>` (ou o cookie `_tk`) e exige `x-workspace-id`.'
+      security:
+        - apiKeyBearer: []
+          workspaceId: []
+        - cookieAuth: []
+          workspaceId: []
+      x-load-weight: pesado
+      x-load-note: Consulta sem paginação sobre todos os lançamentos do período.
+      x-todo: confirmar
+      x-todo-detalhe: Aceita `dataInicio`/`data_inicio` e `dataFim`/`data_fim`; confirmar qual nome é o oficial.
+      parameters:
+        - name: identificador
+          in: query
+          required: false
+          description: Identificador da empresa; precisa ser a mesma do `x-workspace-id`.
+          schema:
+            type: string
+        - name: dataInicio
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date
+            examples:
+              - '2026-10-01'
+        - name: data_inicio
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date
+        - name: dataFim
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date
+            examples:
+              - '2026-10-31'
+        - name: data_fim
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date
+        - name: clienteInicio
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: clienteFim
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: projetoInicio
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: projetoFim
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: colaboradorInicio
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: colaboradorFim
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: atividadeInicio
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: atividadeFim
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: tipoAtividadeInicio
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: tipoAtividadeFim
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Registros.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: boolean
+                    const: false
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RegistroIntegracao'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '"Acesso negado aos dados desta empresa."'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /health:
+    get:
+      tags: [sistema]
+      operationId: health
+      summary: Verificação de saúde
+      security: []
+      x-load-weight: leitura
+      responses:
+        '200':
+          description: Serviço no ar.
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: Funcionando Thu Oct 15 2026 10:20:00 GMT-0300

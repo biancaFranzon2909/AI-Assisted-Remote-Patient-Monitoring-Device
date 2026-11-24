@@ -1,0 +1,3 @@
+-- AlterTable
+ALTER TABLE "parceiro" ALTER COLUMN "nome_fantasia" SET DATA TYPE VARCHAR(200),
+ALTER COLUMN "razao_social" SET DATA TYPE VARCHAR(200);

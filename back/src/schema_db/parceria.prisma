@@ -1,0 +1,13 @@
+model parceria {
+  id                  Int       @id @default(autoincrement())
+  empresa_id          String    @db.Uuid
+  empresa_parceira_id String    @db.Uuid
+  criado_em           DateTime? @default(now()) @db.Timestamptz(6)
+  criado_por          String    @db.Uuid
+  is_active           Boolean?  @default(true)
+  parceiro_id         String    @unique @db.Uuid
+  empresa_parceira    empresa   @relation(fields: [empresa_parceira_id], references: [id], onDelete: Cascade, map: "fk_empresa_parceira")
+  parceiro            parceiro  @relation(fields: [parceiro_id], references: [id], onDelete: Cascade, map: "fk_parceiro_parceira")
+
+  @@unique([empresa_id, empresa_parceira_id], map: "uk_empresa_empresa_parceira")
+}

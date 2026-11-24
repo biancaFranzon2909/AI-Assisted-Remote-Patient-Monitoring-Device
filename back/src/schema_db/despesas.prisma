@@ -1,0 +1,9 @@
+model despesa {
+  id            String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  lancamento_id String     @db.Uuid
+  nome_despesa  String     @db.VarChar(50)
+  descricao     String?    @db.VarChar(300)
+  valor         Float
+  criado_em     DateTime?  @default(now()) @db.Timestamptz(6)
+  lancamento    lancamento @relation(fields: [lancamento_id], references: [id], onDelete: Cascade)
+}

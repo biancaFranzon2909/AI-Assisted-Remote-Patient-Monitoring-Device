@@ -1,0 +1,8 @@
+model relatorios_log {
+  id         String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  criado_em  DateTime? @default(now()) @db.Timestamptz(6)
+  criado_por String    @db.Uuid
+  filename   String    @db.VarChar(250)
+  filters    String    @db.VarChar(100)
+  usuario    usuario   @relation(fields: [criado_por], references: [id], map: "fk_relatorio_usuario")
+}

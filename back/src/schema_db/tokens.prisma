@@ -1,0 +1,11 @@
+model token {
+  id          Int       @id @default(autoincrement())
+  token_hash  String    @unique @db.VarChar(64)
+  device_info String?
+  ip_address  String?
+  criado_em   DateTime  @default(now())
+  expires_at  DateTime
+  revoked_at  DateTime?
+  usuario_id  String    @db.Uuid
+  usuario     usuario   @relation(fields: [usuario_id], references: [id], onDelete: Cascade)
+}
